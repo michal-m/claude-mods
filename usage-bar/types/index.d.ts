@@ -4,13 +4,21 @@ export type Limit = { percent: number; resetsAt?: string }
 /** The live context window. */
 export type Context = { tokens: number; window: number; percent: number }
 
+/** Session cost (at API prices, as /cost totals it) not yet matched to account credit spend. */
+export type CostEntry = { at: number; cents: number }
+
 /** Extra-usage credits, in the account's minor units (cents). */
 export type Credits = {
   isEnabled: boolean
+  /** The account's credit spend at the last reading. */
   usedCents: number
   currency: string
-  /** usedCents at this session's first reading: what was spent before it. */
-  startCents: number
+  /** This session's share: account spend increases matched to its own cost. */
+  sessionCents: number
+  /** The session's cost at the last reading, in cents. */
+  costCents: number
+  /** Cost since then not yet matched, newest last; entries expire. */
+  pool: CostEntry[]
 }
 
 /** The main thread's prompt cache, as far as the mod can tell. */

@@ -19,10 +19,10 @@ const api = (usedCredits: number, isEnabled = true) =>
     extra_usage: { is_enabled: isEnabled, monthly_limit: 5000, used_credits: usedCredits, currency: 'USD' },
   })
 
-type World = { used: number; isEnabled: boolean; forks: number; agents: { id: string; status: string; type: string; description: string }[] }
+type World = { used: number; isEnabled: boolean; costUsd: number; forks: number; fetches: number; agents: { id: string; status: string; type: string; description: string }[] }
 
 function world(on: any, rateLimits: unknown[] = LIMITS, env: Record<string, string> = {}, usage: Record<string, unknown> = HIT) {
-  const w: World = { used: 1234, isEnabled: true, forks: 0, agents: [] }
+  const w: World = { used: 1234, isEnabled: true, costUsd: 3, forks: 0, fetches: 0, agents: [] }
   const clock = mock.clock(on, { now: NOW }) as any
   mock.store(on)
   mock.env(on, env)
@@ -32,10 +32,14 @@ function world(on: any, rateLimits: unknown[] = LIMITS, env: Record<string, stri
   on('ui.invalidate', () => ({ value: undefined }))
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd ?? '/tmp' }))
   on('session.measure', (_$: any, e: any) => ({ changed: e.changed }))
-  on('session.usage', () => ({ value: { startedAt: NOW, context: { tokens: 412_000, window: 1_000_000, percent: 41 }, rateLimits } }))
+  on('session.usage', () => ({ value: { startedAt: NOW, context: { tokens: 412_000, window: 1_000_000, percent: 41 }, rateLimits, cost: { usd: w.costUsd } } }))
   on('session.authorize', () => ({ value: { handle: 'h', kind: 'bearer' } }))
-  on('http.fetch', () => ({ value: { status: 200, ok: true, headers: {}, text: api(w.used, w.isEnabled) } }))
+  on('http.fetch', () => {
+    w.fetches += 1
+    return { value: { status: 200, ok: true, headers: {}, text: api(w.used, w.isEnabled) } }
+  })
   on('agent.list', () => ({ value: w.agents }))
+  on('turn.complete', () => ({ text: '' }))
   on('model.fork', () => {
     w.forks += 1
     return { value: { isAnswered: true, text: 'OK', usage: HIT } }
@@ -59,12 +63,12 @@ async function step($: any) {
   }
 }
 
-async function band($: any, surface: 'desktop' | 'terminal' = 'desktop', isWorking = false) {
+async function band($: any, surface: 'desktop' | 'terminal' = 'desktop', isWorking = false, bodyColumns = 200) {
   return $.ui.mount({
     plugin: 'usage-bar',
     surface,
     component: 'AbovePrompt',
-    props: { hasSurvey: false, isWorking, maxRows: 10, bodyColumns: 200, scroll: { offset: 0, bodyRows: 9 }, view: {} },
+    props: { hasSurvey: false, isWorking, maxRows: 10, bodyColumns, scroll: { offset: 0, bodyRows: 9 }, view: {} },
   })
 }
 
@@ -77,7 +81,8 @@ function strings(node: any): string[] {
 }
 
 async function texts(ui: any) {
-  return ((await ui.findAll({ type: 'Text' })) as any[]).map(t => t.text as string)
+  // Non-breaking spaces read as spaces.
+  return ((await ui.findAll({ type: 'Text' })) as any[]).map(t => (t.text as string).replace(/\u00a0/g, ' '))
 }
 
 async function cardOf(ui: any, key: string) {
@@ -91,8 +96,12 @@ test('context pill: fill glyph, tokens, chart and the last change', async ($, on
   await start($)
   const ui = await band($)
   const all = await texts(ui)
-  expect(all).toContain('◑')
   expect(all).toContain('412k')
+  const svgs = (await ui.findAll({ type: 'Svg' })) as any[]
+  expect(svgs.some(s => s.props?.alt === 'Context 41% full')).toBe(true)
+  // Half full: the ring and a half-circle wedge.
+  const pie = svgs.find(s => s.props?.alt === 'Context 41% full')
+  expect(String(pie.props.source)).toContain('A6.5 6.5 0 0 1 12.00 18.50z')
   expect(await cardOf(ui, 'context')).toContain('Context 41% of 1M')
 })
 
@@ -102,13 +111,31 @@ test('limit pills: share used, time left, reset in the card', async ($, on) => {
   const ui = await band($)
   const all = await texts(ui)
   expect(all).toContain('32%')
-  expect(all).toContain('· 3h 0m')
+  expect(all).toContain('3h 0m')
   expect(all).toContain('59%')
-  expect(all).toContain('· 3d 0h')
+  expect(all).toContain('3d 0h')
+  const pill: any = await ui.find({ type: 'Box', key: 'five_hour' })
+  expect(pill.props.borderStyle).toBe('round')
+  expect(pill.props.flexGrow).toBe(1)
+  expect((await ui.find({ type: 'Box', key: 'agents' }))).toBeUndefined()
+  expect((await ui.find({ type: 'Box', key: 'context' }))?.props.flexGrow).toBe(0)
+  expect(pill.props.backgroundColor).toBe('rgba(63,166,107,0.13)')
   const svgs = (await ui.findAll({ type: 'Svg' })) as any[]
   expect(svgs.filter(s => String(s.props?.alt).includes('used')).length).toBe(2)
   expect(await cardOf(ui, 'five_hour')).toContain('Session limit (5 hours): 32% used')
   expect(await cardOf(ui, 'seven_day')).toContain('Weekly limit (7 days): 59% used')
+})
+
+test('limit bars: green under 75%, orange from 75%, red from 90%', async ($, on) => {
+  world(on, [
+    { kind: 'five_hour', percentUsed: 80, resetsAt: new Date(NOW + 3_600_000).toISOString() },
+    { kind: 'seven_day', percentUsed: 92, resetsAt: new Date(NOW + 86_400_000).toISOString() },
+  ])
+  await start($)
+  const ui = await band($)
+  const gauges = ((await ui.findAll({ type: 'Svg' })) as any[]).filter(s => String(s.props?.alt).includes('used'))
+  expect(String(gauges[0].props.source)).toContain('fill="#d9962b"')
+  expect(String(gauges[1].props.source)).toContain('fill="#d64545"')
 })
 
 test('credits: spent since the session started, with the Balance link', async ($, on) => {
@@ -116,6 +143,7 @@ test('credits: spent since the session started, with the Balance link', async ($
   await start($)
   await $.command.run({ command: 'usage-bar', args: '', origin: { kind: 'person' }, presentation: { isFullscreen: false, columns: 120 } } as never)
   w.used = 1276
+  w.costUsd += 0.42
   const ran = await $.command.run({ command: 'usage-bar', args: '', origin: { kind: 'person' }, presentation: { isFullscreen: false, columns: 120 } } as never)
   expect(ran.text).toContain('Credits $0.42 this session')
   const ui = await band($)
@@ -123,12 +151,71 @@ test('credits: spent since the session started, with the Balance link', async ($
   expect((await ui.find({ type: 'Link' }))?.props.href).toBe('https://claude.ai/settings/usage')
 })
 
-test('credits: hidden when extra usage is off', async ($, on) => {
+test('credits: $0.00 when on and unused, "disabled" when off', async ($, on) => {
   const { w } = world(on)
   w.isEnabled = false
   await start($)
+  let ui = await band($)
+  expect(await ui.find({ type: 'Box', key: 'credits' })).toBeDefined()
+  expect(await texts(ui)).toContain('disabled')
+  expect(await cardOf(ui, 'credits')).toContain('Usage credits are turned off for your account')
+})
+
+test('credits: turning them on mid-session re-takes the baseline', async ($, on) => {
+  const { w } = world(on)
+  w.isEnabled = false
+  w.used = 0
+  await start($)
+  // Turned on: the account now shows what was spent before this session.
+  w.isEnabled = true
+  w.used = 1843
+  const run = () => $.command.run({ command: 'usage-bar', args: '', origin: { kind: 'person' }, presentation: { isFullscreen: false, columns: 120 } } as never)
+  expect((await run()).text).toContain('Credits $0.00 this session')
+  w.used = 1900
+  w.costUsd += 0.57
+  expect((await run()).text).toContain('Credits $0.57 this session')
+})
+
+test('credits: never more than this session cost', async ($, on) => {
+  const { w } = world(on)
+  await start($)
+  const run = () => $.command.run({ command: 'usage-bar', args: '', origin: { kind: 'person' }, presentation: { isFullscreen: false, columns: 120 } } as never)
+  await run()
+  // Another session spends $1.00 while this one spends $0.30.
+  w.used += 130
+  w.costUsd += 0.3
+  expect((await run()).text).toContain('Credits $0.30 this session')
+  // Only the other session spends: nothing more here.
+  w.used += 200
+  expect((await run()).text).toContain('Credits $0.30 this session')
+})
+
+test('credits: a charge that reaches the account late still counts', async ($, on) => {
+  const { w } = world(on)
+  await start($)
+  const run = () => $.command.run({ command: 'usage-bar', args: '', origin: { kind: 'person' }, presentation: { isFullscreen: false, columns: 120 } } as never)
+  await run()
+  w.costUsd += 0.25 // the turn ran; the account has not caught up yet
+  expect((await run()).text).toContain('Credits $0.00 this session')
+  w.used += 25
+  expect((await run()).text).toContain('Credits $0.25 this session')
+})
+
+test('credits: read again 5 seconds after a reply', async ($, on) => {
+  const { w, clock } = world(on)
+  await start($)
+  await clock.advance(60_000)
+  const before = w.fetches
+  await $.turn.complete({ turnId: 't', answer: '', durationMs: 1, isAborted: false, reason: 'answered' } as never)
+  await clock.advance(5_000)
+  expect(w.fetches).toBe(before + 1)
+})
+
+test('credits: $0.00 while enabled and nothing spent', async ($, on) => {
+  world(on)
+  await start($)
   const ui = await band($)
-  expect(await ui.find({ type: 'Box', key: 'credits' })).toBeUndefined()
+  expect(await texts(ui)).toContain('$0.00')
 })
 
 test('cache: counts down an hour on a plan, Extend restarts it', async ($, on) => {
@@ -136,21 +223,21 @@ test('cache: counts down an hour on a plan, Extend restarts it', async ($, on) =
   await start($)
   await step($)
   let ui = await band($)
-  expect(await texts(ui)).toContain('60 min')
+  expect(await texts(ui)).toContain('60m')
   expect(await ui.find({ type: 'Button', key: 'extend' })).toBeDefined()
   expect(await ui.find({ type: 'Button', key: 'let-expire' })).toBeUndefined()
 
   // 56 minutes on: the reminder, Keep alive and Let it expire.
   await clock.advance(56 * MINUTE)
   ui = await band($)
-  expect(await texts(ui)).toContain('4 min')
-  expect((await ui.find({ type: 'Button', key: 'extend' }))?.props.label).toBe('Keep alive')
+  expect(await texts(ui)).toContain('4m')
+  expect((await ui.find({ type: 'Button', key: 'extend' }))?.props.label.replace(/\u00a0/g, ' ')).toBe('↻ Keep alive')
   expect(await ui.find({ type: 'Button', key: 'let-expire' })).toBeDefined()
 
   await ui.press({ key: 'extend' })
   expect(w.forks).toBe(1)
   ui = await band($)
-  expect(await texts(ui)).toContain('60 min')
+  expect(await texts(ui)).toContain('60m')
 })
 
 test('cache: Let it expire hides the question', async ($, on) => {
@@ -162,7 +249,7 @@ test('cache: Let it expire hides the question', async ($, on) => {
   await ui.press({ key: 'let-expire' })
   ui = await band($)
   expect(await ui.find({ type: 'Button', key: 'let-expire' })).toBeUndefined()
-  expect((await ui.find({ type: 'Button', key: 'extend' }))?.props.label).toBe('Extend')
+  expect((await ui.find({ type: 'Button', key: 'extend' }))?.props.label.replace(/\u00a0/g, ' ')).toBe('↻ Extend')
 })
 
 test('cache: 5 minutes once past a limit, then expired with no button', async ($, on) => {
@@ -170,7 +257,7 @@ test('cache: 5 minutes once past a limit, then expired with no button', async ($
   await start($)
   await step($)
   let ui = await band($)
-  expect(await texts(ui)).toContain('5 min')
+  expect(await texts(ui)).toContain('5m')
   await clock.advance(6 * MINUTE)
   ui = await band($)
   expect(await texts(ui)).toContain('expired')
@@ -182,7 +269,7 @@ test('cache: an environment override wins over the plan default', async ($, on) 
   await start($)
   await step($)
   const ui = await band($)
-  expect(await texts(ui)).toContain('5 min')
+  expect(await texts(ui)).toContain('5m')
   expect(await cardOf(ui, 'cache')).toContain('Lifetime 5 minutes (set by environment)')
 })
 
@@ -191,7 +278,7 @@ test('cache: a 5-minute write within plan limits (credits-only model) means 5 mi
   await start($)
   await step($)
   const ui = await band($)
-  expect(await texts(ui)).toContain('5 min')
+  expect(await texts(ui)).toContain('5m')
   expect(await cardOf(ui, 'cache')).toContain('Lifetime 5 minutes (from the last cache write)')
 })
 
@@ -215,6 +302,21 @@ test('agents: running and total, the running ones in the card', async ($, on) =>
   const ui = await band($)
   expect(await texts(ui)).toContain('1 running · 2')
   expect(await cardOf(ui, 'agents')).toContain('Explore · Find the config')
+})
+
+test('layout: one row when wide, two rows when narrow with credits rightmost', async ($, on) => {
+  const { w } = world(on)
+  w.agents = [{ id: 'a1', status: 'running', type: 'Explore', description: 'Find' }]
+  await start($)
+  await step($)
+  let ui = await band($, 'desktop', false, 200)
+  expect(await ui.find({ type: 'Box', key: 'extras-row' })).toBeUndefined()
+  ui = await band($, 'desktop', false, 60)
+  const extras: any = await ui.find({ type: 'Box', key: 'extras-row' })
+  expect(extras.props.justifyContent).toBe('flex-end')
+  expect(extras.children.map((c: any) => c.props.key)).toEqual(['cache', 'agents', 'credits'])
+  const usage: any = await ui.find({ type: 'Box', key: 'usage-row' })
+  expect(usage.children.map((c: any) => c.props.key)).toEqual(['context', 'five_hour', 'seven_day'])
 })
 
 test('terminal: the engine draws its own band', async ($, on) => {

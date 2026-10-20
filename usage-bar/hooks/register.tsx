@@ -41,26 +41,42 @@ const toCents = (m: Money) => Math.round(m.amount_minor * 10 ** (2 - m.exponent)
 let inFlight: Promise<void> | undefined
 let lastRaw = ''
 
-// Reads the shared reading, fetching a new one when it is stale (or `force`),
-// unless the endpoint asked everyone to back off. A call made while another
-// runs waits for it; a forced one then reads again.
-async function refreshCredits($: $, force = false) {
+// Reads the shared reading, fetching a new one once it is older than
+// `maxAgeMs`, unless the endpoint asked everyone to back off. A call made
+// while another runs waits for it, then reads again if it asked for fresher.
+async function refreshCredits($: $, maxAgeMs = FRESH_MS) {
   if (inFlight) {
     await inFlight
-    if (!force) return
+    if (maxAgeMs >= FRESH_MS) return
   }
-  inFlight = fetchCredits($, force).finally(() => (inFlight = undefined))
+  inFlight = fetchCredits($, maxAgeMs).finally(() => (inFlight = undefined))
   await inFlight
 }
 
-async function fetchCredits($: $, force: boolean) {
+// After a reply or a subagent's last turn: read again 5 seconds later, once,
+// however many finish together, and only if the last reading is 30 s old.
+const SOON_MS = 5_000
+const SOON_MAX_AGE_MS = 30_000
+let isSoon = false
+async function refreshCreditsSoon($: $) {
+  if (isSoon) return
+  isSoon = true
+  try {
+    await $.clock.sleep(SOON_MS)
+  } finally {
+    isSoon = false
+  }
+  await refreshCredits($, SOON_MAX_AGE_MS)
+}
+
+async function fetchCredits($: $, maxAgeMs: number) {
   try {
     const now = await $.clock.now()
     const shared = (await $.store.get('reading')) as Shared | undefined
     const block = (await $.store.get('block')) as Block | undefined
-    const isFresh = shared !== undefined && now - shared.fetchedAt < FRESH_MS
+    const isFresh = shared !== undefined && now - shared.fetchedAt < maxAgeMs
     const isBlocked = block !== undefined && now < block.until
-    if ((isFresh && !force) || isBlocked) {
+    if (isFresh || isBlocked) {
       if (shared) await applyCredits($, shared)
       return
     }
@@ -91,25 +107,54 @@ async function fetchCredits($: $, force: boolean) {
   }
 }
 
+// Credits are billed at API prices, which is what the session's own cost
+// counts. The account says how much credit spend rose between two readings;
+// this session claims that rise only up to its own cost of the last
+// POOL_MS not yet claimed. So the figure never passes what the session cost
+// nor what the account was charged: turning credits on (the account then
+// shows earlier spend) or another session spending while this one idles adds
+// nothing. Two sessions spending at the same moment can split it unevenly.
+const POOL_MS = 15 * MINUTE
+
 async function applyCredits($: $, reading: Shared) {
   const body = JSON.parse(reading.text) as ApiUsage
   const x = body.extra_usage
   if (!x) return
   const used = body.spend?.used
   const now = await $.clock.now()
+  let costCents = 0
+  try {
+    costCents = ((await $.session.usage()).cost?.usd ?? 0) * 100
+  } catch {
+    // No ledger: nothing to match.
+  }
   await update($, bar, b => {
     const usedCents = used ? toCents(used) : (x.used_credits ?? 0)
-    // The first reading of the session is the baseline; a monthly reset (used
-    // drops below it) starts the count from zero.
-    const baseline = b.credits?.startCents ?? usedCents
-    const credits: Credits = {
-      isEnabled: x.is_enabled === true,
-      usedCents,
-      currency: used?.currency ?? x.currency ?? 'USD',
-      startCents: usedCents < baseline ? 0 : baseline,
+    const isEnabled = x.is_enabled === true
+    const prev = b.credits
+    // A first reading, or one from before the reset fix: start matching now.
+    if (!prev || prev.pool === undefined) {
+      const credits: Credits = { isEnabled, usedCents, currency: used?.currency ?? x.currency ?? 'USD', sessionCents: 0, costCents, pool: [] }
+      return { ...b, credits }
     }
-    const hasMoved = b.credits !== undefined && usedCents > b.credits.usedCents
-    return { ...b, credits, creditsMovedAt: hasMoved ? now : b.creditsMovedAt }
+    const added = Math.max(0, costCents - prev.costCents)
+    let pool = [...prev.pool, ...(added > 0 ? [{ at: now, cents: added }] : [])].filter(p => now - p.at < POOL_MS)
+    let sessionCents = prev.sessionCents
+    const rise = prev.isEnabled && isEnabled ? usedCents - prev.usedCents : 0
+    if (rise > 0) {
+      // Claim from the oldest unmatched cost first.
+      let left = rise
+      const kept: typeof pool = []
+      for (const p of pool) {
+        const take = Math.min(left, p.cents)
+        left -= take
+        sessionCents += take
+        if (p.cents - take > 0.001) kept.push({ at: p.at, cents: p.cents - take })
+      }
+      pool = kept
+    }
+    const credits: Credits = { isEnabled, usedCents, currency: used?.currency ?? x.currency ?? 'USD', sessionCents, costCents, pool }
+    return { ...b, credits, creditsMovedAt: rise > 0 ? now : b.creditsMovedAt }
   })
 }
 
@@ -119,7 +164,7 @@ const money = (cents: number, currency: string) => {
   return symbol ? `${symbol}${amount}` : `${amount} ${currency}`
 }
 
-const creditsSpent = (c: Credits) => Math.max(0, c.usedCents - c.startCents)
+const creditsSpent = (c: Credits) => Math.round(c.sessionCents)
 
 // ---------- Limits ----------
 
@@ -137,39 +182,46 @@ const elapsedPercent = (l: Limit, span: number, now: number) => {
   return Math.max(0, Math.min(100, (1 - (at - now) / span) * 100))
 }
 
-// Green while use keeps behind time; amber ahead of it; red from 90%, or when
-// the pace would use the window up well before its reset.
+// As Claude's own usage bars: green under 75%, orange from 75%, red from 90%.
 type Tone = 'success' | 'warning' | 'error'
-const toneOf = (used: number, elapsed: number | undefined): Tone => {
-  if (used >= 90) return 'error'
-  if (elapsed === undefined || used <= elapsed) return 'success'
-  return elapsed > 5 && used / elapsed >= 1.3 ? 'error' : 'warning'
-}
-const COLOR: Record<Tone, string> = { success: '#30a46c', warning: '#e5a000', error: '#e5484d' }
+const toneOf = (used: number): Tone => (used >= 90 ? 'error' : used >= 75 ? 'warning' : 'success')
+// Bar colors, and text colors readable on the tinted pills (the theme's yellow
+// is too bright on them: a deep amber).
+const COLOR: Record<Tone, string> = { success: '#3fa66b', warning: '#d9962b', error: '#d64545' }
+const TEXT_COLOR: Record<Tone, string | undefined> = { success: undefined, warning: '#a8690a', error: '#d64545' }
 const GREY = 'rgba(127,127,127,0.55)'
 const TRACK = 'rgba(127,127,127,0.2)'
 
-const GAUGE = { width: 54, height: 8 }
-// Used share solid; the gap to the time elapsed hatched: grey while there is
-// margin, in the bar's color when use runs ahead of time.
-function gaugeSvg(used: number, elapsed: number | undefined, tone: Tone) {
-  const { width: w, height: h } = GAUGE
-  const x = (p: number) => (Math.max(0, Math.min(100, p)) / 100) * w
+// minWidth in cells (about 32 px; a cell is about 10 px), height in CSS pixels. The markup is drawn
+// wider than any band (`drawnWidth`) and the app caps an Svg with no width
+// prop at its slot, so the bar takes exactly the room its box is given.
+const GAUGE = { minWidth: 3, height: 9, drawnWidth: 4000 }
+const HATCH = { back: 'rgba(127,127,127,0.16)', line: 'rgba(127,127,127,0.6)' }
+// A rounded bar, solid up to the share used; the gap to the time elapsed is
+// hatched: grey after the bar (margin left), in the bar's color when use runs
+// ahead of time. After Token Weather Usage's gauge (Apache-2.0, see NOTICE).
+// Drawn in percentages with no viewBox, so it fits whatever width it is
+// capped to while the stripes keep their size.
+function gaugeSvg(id: string, usedPercent: number, elapsed: number | undefined, tone: Tone) {
+  const { height } = GAUGE
+  const radius = height / 2
+  const used = Math.max(0, Math.min(100, usedPercent))
+  const time = elapsed === undefined ? used : Math.max(0, Math.min(100, elapsed))
+  const pct = (n: number) => `${n.toFixed(1)}%`
   const color = COLOR[tone]
-  const parts = [`<rect width="${w}" height="${h}" rx="2" fill="${TRACK}"/>`]
-  const solidTo = elapsed === undefined ? used : Math.min(used, elapsed)
-  parts.push(`<rect width="${x(solidTo).toFixed(1)}" height="${h}" rx="2" fill="${color}"/>`)
-  if (elapsed !== undefined && Math.abs(used - elapsed) >= 1) {
-    const from = x(Math.min(used, elapsed))
-    const to = x(Math.max(used, elapsed))
-    const hatch = used > elapsed ? color : GREY
-    parts.push(`<rect x="${from.toFixed(1)}" width="${(to - from).toFixed(1)}" height="${h}" fill="url(#hatch)"/>`)
-    parts.unshift(
-      `<defs><pattern id="hatch" width="3" height="3" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">` +
-        `<rect width="1.4" height="3" fill="${hatch}"/></pattern></defs>`,
-    )
-  }
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">${parts.join('')}</svg>`
+  const stripes = (name: string, back: string, backOpacity: number, line: string) =>
+    `<pattern id="${name}" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">` +
+    `<rect width="4" height="4" fill="${back}" fill-opacity="${backOpacity}"/><rect width="1.6" height="4" fill="${line}"/></pattern>`
+  const defs =
+    `<defs>${stripes(id + 'm', HATCH.back, 1, HATCH.line)}${stripes(id + 'a', color, 0.35, color)}` +
+    `<clipPath id="${id}t"><rect width="100%" height="${height}" rx="${radius}"/></clipPath>` +
+    `<clipPath id="${id}b"><rect width="${pct(used)}" height="${height}" rx="${radius}"/></clipPath></defs>`
+  let body = `<rect width="100%" height="${height}" fill="${TRACK}"/>`
+  if (time > used) body += `<rect width="${pct(time)}" height="${height}" fill="url(#${id}m)"/>`
+  body += `<g clip-path="url(#${id}b)"><rect width="${pct(Math.min(used, time))}" height="${height}" fill="${color}"/>`
+  if (used > time) body += `<rect x="${pct(time)}" width="${pct(used - time)}" height="${height}" fill="url(#${id}a)"/>`
+  body += '</g>'
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${GAUGE.drawnWidth}" height="${height}">${defs}<g clip-path="url(#${id}t)">${body}</g></svg>`
 }
 
 // "2h 24m", "2d 20h", "8m": time until a reset.
@@ -180,8 +232,9 @@ function left(resetsAt: string | undefined, now: number) {
   const d = Math.floor(ms / DAY)
   const h = Math.floor((ms % DAY) / HOUR)
   const m = Math.floor((ms % HOUR) / MINUTE)
-  if (d > 0) return `${d}d ${h}h`
-  if (h > 0) return `${h}h ${m}m`
+  // Non-breaking spaces: a squeezed pill must not break "2h 14m" over two lines.
+  if (d > 0) return `${d}d\u00a0${h}h`
+  if (h > 0) return `${h}h\u00a0${m}m`
   return `${m}m`
 }
 
@@ -197,9 +250,6 @@ const dayTime = (ms: number) => `${DAYS[new Date(ms).getDay()]} ${clockTime(ms)}
 const HISTORY = 6 // readings kept: five deltas for the chart
 const SPARK = { height: 14, bar: 5, gap: 2 }
 
-// ○ ◔ ◑ ◕ ●: the window filling up.
-const fillGlyph = (percent: number) =>
-  percent < 12.5 ? '○' : percent < 37.5 ? '◔' : percent < 62.5 ? '◑' : percent < 87.5 ? '◕' : '●'
 const contextTone = (percent: number): Tone => (percent >= 75 ? 'error' : percent >= 50 ? 'warning' : 'success')
 
 const pushReading = (readings: number[], tokens: number) => {
@@ -399,6 +449,7 @@ const summary = (b: Bar) =>
     b.credits && `Credits ${b.credits.isEnabled ? money(creditsSpent(b.credits), b.credits.currency) : 'off'} this session`,
     `Agents ${b.running.length} running, ${b.agentIds.length} seen`,
     lastKeepAlive && `Last keep-alive ${lastKeepAlive}`,
+    lastLayout && `Band ${lastLayout}`,
   ]
     .filter(Boolean)
     .join('\n')
@@ -466,8 +517,10 @@ export const register: Register = on => {
   // endpoint, so read them again (if stale).
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
+    // A subagent finished its job: its spend reaches the account too.
     if (e.agentId) {
       void refreshAgents($)
+      void refreshCreditsSoon($)
       return result
     }
     try {
@@ -477,7 +530,7 @@ export const register: Register = on => {
     } catch {
       // No reading this turn: the band keeps the previous one.
     }
-    void refreshCredits($)
+    void refreshCreditsSoon($)
     return result
   })
 
@@ -504,8 +557,10 @@ export const register: Register = on => {
     return result
   })
 
-  on('command.run', { command: 'usage-bar' }, async $ => {
-    await refreshCredits($, true)
+  on('command.run', { command: 'usage-bar' }, async ($, e) => {
+    await refreshCredits($, 0)
+    // `/usage-bar reset`: count credits from now on.
+    if (e.args.trim() === 'reset') await update($, bar, b => (b.credits ? { ...b, credits: { ...b.credits, sessionCents: 0, pool: [] } } : b))
     await refreshAgents($)
     const now = await $.clock.now()
     const b = await update($, bar, b => ({ ...b, now }))
@@ -518,7 +573,7 @@ export const register: Register = on => {
     const b = await read($, bar)
     if (!b.context && !b.session && !b.weekly) return next(e)
     const els = $.ui.resolve(e)
-    const line = drawLine($, els, b, e.props.isWorking)
+    const line = drawLine($, els, b, e.props.isWorking, e.props.bodyColumns)
     // Mods placed after us draw below our line.
     const below = await next(e)
     return isBlank(below) ? line : <els.Box flexDirection="column">{line}{below}</els.Box>
@@ -533,9 +588,82 @@ function isBlank(node: unknown) {
 }
 
 // ---------- Drawing ----------
+// Pills, icons and tints adapted from Token Weather Usage by Eric Cologni
+// (https://github.com/augiefra/claude-mods, Apache-2.0); see NOTICE.
 
-// A card under the pointer: hidden until the pill is hovered, drawn above the band.
-// An indented line is a detail of the one above it: dim.
+// Desktop pills: a light tint and a slightly stronger outline per pill.
+const TINTS: Record<string, [string, string]> = {
+  context: ['rgba(47,104,192,0.10)', 'rgba(47,104,192,0.28)'],
+  five_hour: ['rgba(63,166,107,0.13)', 'rgba(63,166,107,0.32)'],
+  seven_day: ['rgba(140,100,210,0.13)', 'rgba(140,100,210,0.32)'],
+  cache: ['rgba(27,161,196,0.11)', 'rgba(27,161,196,0.30)'],
+  cacheSoon: ['rgba(217,150,43,0.14)', 'rgba(217,150,43,0.36)'],
+  cacheGone: ['rgba(214,69,69,0.12)', 'rgba(214,69,69,0.36)'],
+  credits: ['rgba(184,140,40,0.13)', 'rgba(184,140,40,0.34)'],
+  agents: ['rgba(196,80,127,0.11)', 'rgba(196,80,127,0.32)'],
+}
+
+// Icon colors: deeper than the pill's tint, readable on light and dark backgrounds.
+const ICON_COLOR = {
+  context: '#2f68c0',
+  five_hour: '#3a9a62',
+  seven_day: '#8a5fd0',
+  cache: '#1b9cbe',
+  cacheSoon: '#d9962b',
+  cacheGone: '#d64545',
+  credits: '#b8892a',
+  agents: '#c4507f',
+}
+
+const ICON_SIZE = 16
+const SMALL_ICON = 14
+
+// Small outlined icons, drawn on a 24-unit grid in the pill's color.
+const ICONS = {
+  gauge: (c: string) =>
+    `<g transform="translate(0 0.5)"><path d="M3.6 18.5a9.5 9.5 0 1 1 16.8 0" fill="none" stroke="${c}" stroke-width="2.2" stroke-linecap="round"/><path d="M12 14.5l4.3-4.6" fill="none" stroke="${c}" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="14.5" r="1.7" fill="${c}"/></g>`,
+  calendar: (c: string) =>
+    `<rect x="3" y="4.5" width="18" height="17" rx="3" fill="none" stroke="${c}" stroke-width="2"/><path d="M3 9.5h18M8 2.5v4M16 2.5v4" fill="none" stroke="${c}" stroke-width="2" stroke-linecap="round"/><text x="12" y="19.2" font-size="8.5" font-weight="700" font-family="-apple-system,Helvetica,Arial,sans-serif" text-anchor="middle" fill="${c}">7</text>`,
+  // A clock turning back: the time left before the window starts over.
+  clock: (c: string) =>
+    `<path d="M4.2 13A8 8 0 1 0 6.6 6.2" fill="none" stroke="${c}" stroke-width="2.1" stroke-linecap="round"/><path d="M3.4 3.6v4.2h4.2" fill="none" stroke="${c}" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/><path d="M12 8v4.6l3 1.8" fill="none" stroke="${c}" stroke-width="2.1" stroke-linecap="round"/>`,
+  bolt: (c: string) =>
+    `<path d="M13.2 2 4 13.6h7.2L10.4 22l9.2-11.6h-7.2z" fill="${c}" fill-opacity="0.18" stroke="${c}" stroke-width="2" stroke-linejoin="round"/>`,
+  coin: (c: string) =>
+    `<circle cx="12" cy="12" r="9.5" fill="${c}" fill-opacity="0.16" stroke="${c}" stroke-width="2"/><path d="M15 8.8c-.5-1-1.6-1.6-3-1.6-1.7 0-3 .9-3 2.2s1.3 1.8 3 2.1 3 .9 3 2.2-1.3 2.3-3 2.3c-1.4 0-2.5-.6-3.1-1.6M12 5.6v1.6M12 16.8v1.6" fill="none" stroke="${c}" stroke-width="1.9" stroke-linecap="round"/>`,
+  agents: (c: string) =>
+    `<rect x="4" y="7.5" width="16" height="12.5" rx="3.5" fill="${c}" fill-opacity="0.14" stroke="${c}" stroke-width="2"/><path d="M12 7.5V4M2 12.5v3M22 12.5v3" fill="none" stroke="${c}" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="3.2" r="1.3" fill="${c}"/><circle cx="9" cy="13" r="1.5" fill="${c}"/><circle cx="15" cy="13" r="1.5" fill="${c}"/><path d="M9.5 16.8h5" fill="none" stroke="${c}" stroke-width="1.8" stroke-linecap="round"/>`,
+}
+
+function icon({ Svg }: Els, key: string, body: string, alt: string, size = ICON_SIZE) {
+  const source = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24">${body}</svg>`
+  return <Svg key={key} source={source} alt={alt} width={size} height={size} />
+}
+
+// The context icon: ○ ◔ ◑ ◕ ● drawn as a pie, filled by quarters.
+function fillIcon(percent: number, color: string) {
+  const quarters = percent < 12.5 ? 0 : percent < 37.5 ? 1 : percent < 62.5 ? 2 : percent < 87.5 ? 3 : 4
+  const ring = `<circle cx="12" cy="12" r="9" fill="none" stroke="${color}" stroke-width="2"/>`
+  if (quarters === 0) return ring
+  if (quarters === 4) return `${ring}<circle cx="12" cy="12" r="6.5" fill="${color}"/>`
+  // A wedge from 12 o'clock, clockwise.
+  const r = 6.5
+  const angle = (quarters / 4) * 2 * Math.PI
+  const x = 12 + r * Math.sin(angle)
+  const y = 12 - r * Math.cos(angle)
+  const wedge = `<path d="M12 12V${12 - r}A${r} ${r} 0 ${quarters > 2 ? 1 : 0} 1 ${x.toFixed(2)} ${y.toFixed(2)}z" fill="${color}"/>`
+  return `${ring}${wedge}`
+}
+
+const divider = ({ Text }: Els, key: string) => (
+  <Text key={key} dimColor>
+    │
+  </Text>
+)
+
+// A card under the pointer: hidden until the pill is hovered, drawn above the
+// band in the theme's own colors. An indented line is a detail: dim.
+// No key: a keyed Box would scope its own hover, and a hidden one is never hovered.
 function hoverCard({ Box, Text }: Els, lines: (string | false | undefined)[], extra?: unknown) {
   const shown = lines.filter((l): l is string => typeof l === 'string')
   return (
@@ -561,39 +689,120 @@ function hoverCard({ Box, Text }: Els, lines: (string | false | undefined)[], ex
   )
 }
 
-function pill(els: Els, key: string, body: unknown, card: unknown) {
-  const { Box } = els
+// A tinted, outlined pill that never shrinks (squeezed, the app breaks "24 %"
+// over two lines). The app rounds a Box only through its border, whose padding
+// would make the band taller than the prompt box: paddingY takes it back.
+// A keyed pill is a hover scope: its card shows while the pointer is over it.
+// The limit pills grow (`grow`) to share the row's spare width, their bars
+// stretching with them, so the band spans the full width whichever pills show.
+// No pill shrinks: a row too narrow wraps (see drawLine) rather than squeeze.
+function pill({ Box }: Els, key: string, tint: [string, string], parts: unknown[], card: unknown, grow = false) {
   return (
-    <Box key={key} position="relative" flexDirection="row" alignItems="center" columnGap={1} flexShrink={0}>
-      {body as never}
+    <Box
+      key={key}
+      flexDirection="row"
+      alignItems="center"
+      columnGap={0.5}
+      flexGrow={grow ? 1 : 0}
+      flexShrink={0}
+      paddingX={1}
+      paddingY={0}
+      borderStyle="round"
+      borderColor={tint[1]}
+      backgroundColor={tint[0]}
+    >
+      {parts.filter(Boolean) as never}
       {card as never}
     </Box>
   )
 }
 
-function drawLine($: $, els: Els, b: Bar, isWorking: boolean) {
-  const { Box, Text } = els
-  const pills = [
+// Whether one row fits: the band's width comes in cells of the app's code
+// font (about 10 px each); what the pills need is estimated in CSS pixels,
+// from sizes measured in the app. Kept for /usage-bar, to tune.
+let lastLayout = ''
+
+const PX = {
+  cell: 10,
+  char: 7.5, // the app's proportional text, on average (digits run wider)
+  icon: ICON_SIZE,
+  smallIcon: SMALL_ICON,
+  gap: 5, // columnGap 0.5 inside a pill
+  pill: 22, // border and padding, both sides
+  between: 10, // columnGap 1 between pills
+  band: 20, // the band's own padding
+  button: 12, // the native button's chrome around its label
+  sparkBar: SPARK.bar + SPARK.gap,
+}
+// Spare room kept on a one-row band (split view showed the estimate runs short).
+const MARGIN_CELLS = 6
+// Once on two rows, one row comes back only with this much more room: no bouncing.
+const HYSTERESIS_CELLS = 4
+let wasTwoRows = false
+const textPx = (text: string) => text.length * PX.char
+const pillPx = (parts: number[]) => PX.pill + parts.reduce((a, n) => a + n, 0) + (parts.length - 1) * PX.gap
+
+// Each changing value counts at its widest form, so a ticking countdown or a
+// growing token count never moves the threshold.
+const widest = (text: string, template: string) => textPx(text.length > template.length ? text : template)
+
+function oneRowCells(b: Bar, isWorking: boolean) {
+  const widths: number[] = []
+  if (b.context) {
+    widths.push(pillPx([PX.icon, widest(short(b.context.tokens), '999.9k'), (HISTORY - 1) * PX.sparkBar, widest(trend(b.readings), '▲ +99.9k')]))
+  }
+  for (const l of [b.session, b.weekly]) {
+    if (!l) continue
+    widths.push(pillPx([PX.icon, textPx('5h'), GAUGE.minWidth * PX.cell, textPx('100%'), PX.smallIcon, textPx('22h\u00a059m')]))
+  }
+  if (b.cache) {
+    const v = cacheView(b, b.cache, isWorking)
+    // The widest it gets: the reminder, with both buttons.
+    widths.push(pillPx([PX.icon, widest(v.status, '60m'), textPx('↻\u00a0Keep\u00a0alive') + PX.button, textPx('Let it expire')]))
+  }
+  if (b.credits) widths.push(pillPx([PX.icon, widest(creditsText(b.credits), '€000.00')]))
+  if (b.agentIds.length > 0) widths.push(pillPx([PX.icon, widest(agentsText(b), '9 running · 99')]))
+  const px = widths.reduce((a, n) => a + n, 0) + (widths.length - 1) * PX.between + PX.band
+  return Math.ceil(px / PX.cell) + MARGIN_CELLS
+}
+
+function drawLine($: $, els: Els, b: Bar, isWorking: boolean, columns: number) {
+  const { Box } = els
+  const usage = [
     b.context && contextPill(els, b),
     b.session && limitPill(els, 'five_hour', '5h', b.session, b.now),
     b.weekly && limitPill(els, 'seven_day', '7d', b.weekly, b.now),
-    b.cache && cachePill($, els, b, b.cache, isWorking),
-    b.credits?.isEnabled && creditsPill(els, b.credits),
-    b.agentIds.length > 0 && agentsPill(els, b),
   ].filter(Boolean)
-  const children: unknown[] = []
-  pills.forEach((p, i) => {
-    if (i > 0)
-      children.push(
-        <Text key={`sep${i}`} dimColor>
-          │
-        </Text>,
-      )
-    children.push(p)
-  })
+  const cache = b.cache && cachePill($, els, b, b.cache, isWorking)
+  const credits = b.credits && creditsPill(els, b.credits)
+  const agents = b.agentIds.length > 0 && agentsPill(els, b)
+  const needs = oneRowCells(b, isWorking)
+  const isOneRow = columns >= needs + (wasTwoRows ? HYSTERESIS_CELLS : 0)
+  wasTwoRows = !isOneRow
+  lastLayout = `${columns} columns, one row needs ~${needs}: ${isOneRow ? 'one row' : 'two rows'}`
+  // One row: the limit pills take the spare width, or give it back, their bars
+  // stretching or shrinking down to a minimum.
+  if (isOneRow)
+    return (
+      // Wrap only as a fallback, when the estimate let through a row that
+      // does not fit: pills move down rather than spill.
+      <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={1} rowGap={1} paddingX={1}>
+        {[...usage, cache, credits, agents].filter(Boolean) as never}
+      </Box>
+    )
+  // Too narrow (the narrow chat column): usage on the first row; cache,
+  // agents and credits on the second, right-aligned at their own size.
+  const second = [cache, agents, credits].filter(Boolean)
   return (
-    <Box flexDirection="row" alignItems="center" columnGap={1} flexWrap="wrap">
-      {children as never}
+    <Box flexDirection="column" rowGap={1} paddingX={1}>
+      <Box key="usage-row" flexDirection="row" flexWrap="nowrap" alignItems="center" columnGap={1}>
+        {usage as never}
+      </Box>
+      {second.length > 0 && (
+        <Box key="extras-row" flexDirection="row" flexWrap="nowrap" alignItems="center" justifyContent="flex-end" columnGap={1}>
+          {second as never}
+        </Box>
+      )}
     </Box>
   )
 }
@@ -602,16 +811,15 @@ function contextPill(els: Els, b: Bar) {
   const { Text, Svg } = els
   const c = b.context!
   const tone = contextTone(c.percent)
-  const spark = sparkSvg(b.readings, COLOR[tone])
+  const color = tone === 'success' ? ICON_COLOR.context : COLOR[tone]
+  const spark = sparkSvg(b.readings, color)
   const t = trend(b.readings)
-  const body = [
-    <Text key="glyph" color={tone}>
-      {fillGlyph(c.percent)}
+  const parts = [
+    icon(els, 'icon', fillIcon(c.percent, color), `Context ${c.percent}% full`),
+    <Text key="tokens" bold>
+      {short(c.tokens)}
     </Text>,
-    <Text key="tokens">{short(c.tokens)}</Text>,
-    spark && (
-      <Svg key="spark" source={spark.source} alt="Tokens added by recent prompts" width={spark.width} height={SPARK.height} />
-    ),
+    spark && <Svg key="spark" source={spark.source} alt="Tokens added by recent prompts" width={spark.width} height={SPARK.height} />,
     t && (
       <Text key="trend" dimColor>
         {t}
@@ -623,31 +831,32 @@ function contextPill(els: Els, b: Bar) {
     `  ${c.tokens.toLocaleString('en-US')} tokens`,
     deltas(b.readings).length > 0 && `  Last prompts: ${deltas(b.readings).map(d => `+${short(d)}`).join(', ')}`,
   ])
-  return pill(els, 'context', body, card)
+  return pill(els, 'context', TINTS.context!, parts, card)
 }
 
-function limitPill(els: Els, kind: string, label: string, l: Limit, now: number) {
-  const { Text, Svg } = els
+function limitPill(els: Els, kind: 'five_hour' | 'seven_day', label: string, l: Limit, now: number) {
+  const { Box, Text, Svg } = els
   const elapsed = elapsedPercent(l, SPANS[kind] ?? DAY, now)
-  const tone = toneOf(l.percent, elapsed)
+  const tone = toneOf(l.percent)
   const rest = left(l.resetsAt, now)
-  const body = [
-    <Text key="label" dimColor>
-      {label}
-    </Text>,
-    <Svg
-      key="gauge"
-      source={gaugeSvg(l.percent, elapsed, tone)}
-      alt={`${label} ${l.percent}% used`}
-      width={GAUGE.width}
-      height={GAUGE.height}
-    />,
-    <Text key="value" color={tone === 'success' ? undefined : tone}>
+  const color = ICON_COLOR[kind]
+  const parts = [
+    icon(els, 'icon', kind === 'five_hour' ? ICONS.gauge(color) : ICONS.calendar(color), kind === 'five_hour' ? 'Session limit' : 'Weekly limit'),
+    <Text key="label">{label}</Text>,
+    // The bar starts at its minimum and grows into the pill's share of the
+    // spare width; nothing in a pill shrinks, so no pill gets narrower than
+    // its content and its reset time never spills out. No key: a keyed Box is
+    // a hover scope, and the pill's own must hold.
+    <Box width={GAUGE.minWidth} flexGrow={1} flexShrink={0}>
+      <Svg source={gaugeSvg(kind, l.percent, elapsed, tone)} alt={`${label} ${l.percent}% used`} height={GAUGE.height} />
+    </Box>,
+    <Text key="value" bold color={TEXT_COLOR[tone]}>
       {Math.round(l.percent)}%
     </Text>,
+    rest && icon(els, 'clock', ICONS.clock(color), 'Resets in', SMALL_ICON),
     rest && (
       <Text key="left" dimColor>
-        · {rest}
+        {rest}
       </Text>
     ),
   ]
@@ -658,12 +867,11 @@ function limitPill(els: Els, kind: string, label: string, l: Limit, now: number)
     elapsed !== undefined && `  ${Math.round(elapsed)}% of the window has passed`,
     !Number.isNaN(at) && `  Resets ${kind === 'five_hour' ? `at ${clockTime(at)}` : dayTime(at)}`,
   ])
-  return pill(els, kind, body, card)
+  return pill(els, kind, TINTS[kind]!, parts, card, true)
 }
 
-function cachePill($: $, els: Els, b: Bar, c: Cache, isWorking: boolean) {
-  const { Text, Button } = els
-  const ttl = ttlMs(b)
+// What the cache pill shows; shared with the width estimate.
+function cacheView(b: Bar, c: Cache, isWorking: boolean) {
   const ms = cacheLeftMs(b, c)
   const minutes = Math.ceil(ms / MINUTE)
   const isExpired = ms <= 0 && !c.isCompacted
@@ -678,23 +886,35 @@ function cachePill($: $, els: Els, b: Bar, c: Cache, isWorking: boolean) {
         : isExpired
           ? 'expired'
           : minutes > 1
-            ? `${minutes} min`
-            : '< 1 min'
-  const color = isExpired ? 'error' : isAsking ? 'warning' : undefined
-  const body = [
-    <Text key="label" dimColor>
-      cache
-    </Text>,
-    <Text key="status" color={color} dimColor={!color && !isWorking}>
+            ? `${minutes}m`
+            : '<\u00a01m'
+  const buttonLabel = isAsking ? '↻\u00a0Keep\u00a0alive' : '↻\u00a0Extend'
+  return { isExpired, isAsking, canExtend, status, buttonLabel }
+}
+
+function cachePill($: $, els: Els, b: Bar, c: Cache, isWorking: boolean) {
+  const { Text, Button } = els
+  const ttl = ttlMs(b)
+  const { isExpired, isAsking, canExtend, status, buttonLabel } = cacheView(b, c, isWorking)
+  const look = isExpired ? 'cacheGone' : isAsking ? 'cacheSoon' : 'cache'
+  const tone: Tone = isExpired ? 'error' : isAsking ? 'warning' : 'success'
+  const parts = [
+    icon(els, 'icon', ICONS.bolt(ICON_COLOR[look]), 'Prompt cache'),
+    <Text key="status" bold={!c.isCompacted} dimColor={c.isCompacted} color={TEXT_COLOR[tone]}>
       {status}
-      {c.keepAlive === 'failed' ? ' · extend failed' : ''}
     </Text>,
+    c.keepAlive === 'failed' && divider(els, 'sep'),
+    c.keepAlive === 'failed' && (
+      <Text key="failed" dimColor>
+        extend failed
+      </Text>
+    ),
     canExtend && (
+      // The app's own button, not plain text: it reads as something to press.
       <Button
         key="extend"
-        label={isAsking ? 'Keep alive' : 'Extend'}
+        label={buttonLabel}
         variant={isAsking ? 'primary' : 'secondary'}
-        plain={isAsking ? undefined : true}
         onPress={() => keepAlive($)}
       />
     ),
@@ -707,36 +927,45 @@ function cachePill($: $, els: Els, b: Bar, c: Cache, isWorking: boolean) {
     canExtend && `  Extend sends one tiny request that reads ${short(c.tokens)} tokens from the cache`,
     canExtend && '  (about a tenth of the input price, counted against your limits)',
   ])
-  return pill(els, 'cache', body, card)
+  return pill(els, 'cache', TINTS[look]!, parts, card)
 }
+
+// What the credits pill reads: the spend since the session started, or
+// "disabled" while extra usage is off on the account.
+const creditsText = (c: Credits) => (c.isEnabled ? money(creditsSpent(c), c.currency) : 'disabled')
 
 function creditsPill(els: Els, c: Credits) {
   const { Text, Link } = els
-  const body = [
-    <Text key="label" dimColor>
-      credits
+  const parts = [
+    icon(els, 'icon', ICONS.coin(ICON_COLOR.credits), 'Usage credits'),
+    <Text key="value" bold={c.isEnabled} dimColor={!c.isEnabled}>
+      {creditsText(c)}
     </Text>,
-    <Text key="value">{money(creditsSpent(c), c.currency)}</Text>,
   ]
-  const card = hoverCard(
-    els,
-    [
-      'Usage credits spent since this session started',
-      '  Across your whole account, not only this session',
-      '  Read from your account every few minutes',
-    ],
-    <Link key="balance" href={BALANCE_URL} label="Balance" />,
-  )
-  return pill(els, 'credits', body, card)
+  const lines = c.isEnabled
+    ? [
+        'Usage credits this session spent',
+        "  Your account's credit spend, matched to this session's own cost",
+        '  Read from your account 5 seconds after each reply',
+      ]
+    : ['Usage credits are turned off for your account', '  Turn them on in your usage settings']
+  const card = hoverCard(els, lines, <Link key="balance" href={BALANCE_URL} label="Balance" />)
+  return pill(els, 'credits', TINTS.credits!, parts, card)
+}
+
+function agentsText(b: Bar) {
+  const total = b.agentIds.length
+  const running = b.running.length
+  return running > 0 ? `${running} running · ${total}` : total === 1 ? '1 agent' : `${total} agents`
 }
 
 function agentsPill(els: Els, b: Bar) {
   const { Text } = els
   const total = b.agentIds.length
-  const running = b.running.length
-  const text = running > 0 ? `${running} running · ${total}` : total === 1 ? '1 agent' : `${total} agents`
-  const body = [
-    <Text key="value" color={running > 0 ? 'claude' : undefined} dimColor={running === 0}>
+  const text = agentsText(b)
+  const parts = [
+    icon(els, 'icon', ICONS.agents(ICON_COLOR.agents), 'Subagents'),
+    <Text key="value" bold>
       {text}
     </Text>,
   ]
@@ -744,5 +973,5 @@ function agentsPill(els: Els, b: Bar) {
     `${total} subagent${total === 1 ? '' : 's'} this session`,
     ...b.running.map(a => `  ${a.type}${a.description ? ` · ${a.description}` : ''}`),
   ])
-  return pill(els, 'agents', body, card)
+  return pill(els, 'agents', TINTS.agents!, parts, card)
 }

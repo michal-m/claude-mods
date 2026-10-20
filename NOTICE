@@ -1,0 +1,11 @@
+claude-mods
+Copyright 2026 Michal Zalanowski
+
+usage-bar includes code adapted from Token Weather Usage by Eric Cologni
+(https://github.com/augiefra/claude-mods/tree/main/plugins/token-weather-usage),
+Copyright 2026 Eric Cologni, licensed under the Apache License, Version 2.0:
+the desktop pill styling (tints and outlines), the pill icons (gauge, calendar,
+clock, bolt, coin, robot) and the hatched limit gauge.
+Changes: a fill-circle context icon in place of the weather, Claude's own
+75%/90% color thresholds for the limit bars, a usage-credits pill in place of
+the session cost, and a keep-alive button on the prompt cache pill.
