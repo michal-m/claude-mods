@@ -192,36 +192,36 @@ const TEXT_COLOR: Record<Tone, string | undefined> = { success: undefined, warni
 const GREY = 'rgba(127,127,127,0.55)'
 const TRACK = 'rgba(127,127,127,0.2)'
 
-// minWidth in cells (about 32 px; a cell is about 10 px), height in CSS pixels. The markup is drawn
-// wider than any band (`drawnWidth`) and the app caps an Svg with no width
-// prop at its slot, so the bar takes exactly the room its box is given.
-const GAUGE = { minWidth: 3, height: 9, drawnWidth: 4000 }
+// minWidth in cells (about 32 px; a cell is about 10 px), height in CSS pixels.
+const GAUGE = { minWidth: 3, height: 9 }
 const HATCH = { back: 'rgba(127,127,127,0.16)', line: 'rgba(127,127,127,0.6)' }
 // A rounded bar, solid up to the share used; the gap to the time elapsed is
 // hatched: grey after the bar (margin left), in the bar's color when use runs
 // ahead of time. After Token Weather Usage's gauge (Apache-2.0, see NOTICE).
-// Drawn in percentages with no viewBox, so it fits whatever width it is
-// capped to while the stripes keep their size.
-function gaugeSvg(id: string, usedPercent: number, elapsed: number | undefined, tone: Tone) {
+// Drawn at `width` CSS pixels, the bar's estimated room in its pill (see
+// barWidthPx): the app caps an Svg with no width prop at its slot, so a
+// slightly long estimate is scaled down a little, and the stripes keep the
+// original's size instead of changing with every layout.
+function gaugeSvg(id: string, usedPercent: number, elapsed: number | undefined, tone: Tone, width: number) {
   const { height } = GAUGE
   const radius = height / 2
   const used = Math.max(0, Math.min(100, usedPercent))
   const time = elapsed === undefined ? used : Math.max(0, Math.min(100, elapsed))
-  const pct = (n: number) => `${n.toFixed(1)}%`
+  const at = (n: number) => ((n / 100) * width).toFixed(1)
   const color = COLOR[tone]
   const stripes = (name: string, back: string, backOpacity: number, line: string) =>
     `<pattern id="${name}" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">` +
     `<rect width="4" height="4" fill="${back}" fill-opacity="${backOpacity}"/><rect width="1.6" height="4" fill="${line}"/></pattern>`
   const defs =
     `<defs>${stripes(id + 'm', HATCH.back, 1, HATCH.line)}${stripes(id + 'a', color, 0.35, color)}` +
-    `<clipPath id="${id}t"><rect width="100%" height="${height}" rx="${radius}"/></clipPath>` +
-    `<clipPath id="${id}b"><rect width="${pct(used)}" height="${height}" rx="${radius}"/></clipPath></defs>`
-  let body = `<rect width="100%" height="${height}" fill="${TRACK}"/>`
-  if (time > used) body += `<rect width="${pct(time)}" height="${height}" fill="url(#${id}m)"/>`
-  body += `<g clip-path="url(#${id}b)"><rect width="${pct(Math.min(used, time))}" height="${height}" fill="${color}"/>`
-  if (used > time) body += `<rect x="${pct(time)}" width="${pct(used - time)}" height="${height}" fill="url(#${id}a)"/>`
+    `<clipPath id="${id}t"><rect width="${width}" height="${height}" rx="${radius}"/></clipPath>` +
+    `<clipPath id="${id}b"><rect width="${at(used)}" height="${height}" rx="${radius}"/></clipPath></defs>`
+  let body = `<rect width="${width}" height="${height}" fill="${TRACK}"/>`
+  if (time > used) body += `<rect width="${at(time)}" height="${height}" fill="url(#${id}m)"/>`
+  body += `<g clip-path="url(#${id}b)"><rect width="${at(Math.min(used, time))}" height="${height}" fill="${color}"/>`
+  if (used > time) body += `<rect x="${at(time)}" width="${at(used - time)}" height="${height}" fill="url(#${id}a)"/>`
   body += '</g>'
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${GAUGE.drawnWidth}" height="${height}">${defs}<g clip-path="url(#${id}t)">${body}</g></svg>`
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">${defs}<g clip-path="url(#${id}t)">${body}</g></svg>`
 }
 
 // "2h 24m", "2d 20h", "8m": time until a reset.
@@ -766,20 +766,50 @@ function oneRowCells(b: Bar, isWorking: boolean) {
   return Math.ceil(px / PX.cell) + MARGIN_CELLS
 }
 
+// The room each limit bar gets, in CSS pixels: the row's width less what its
+// pills hold (current values, bars at nothing), shared by the limit pills.
+// A little long on purpose: the app scales a long bar down to its slot, while
+// a short one would leave a gap before the percentage.
+const BAR_SLACK = 1.05
+function barWidthPx(b: Bar, isWorking: boolean, columns: number, isOneRow: boolean) {
+  const widths: number[] = []
+  const limits = [b.session, b.weekly].filter(Boolean) as Limit[]
+  if (b.context) {
+    const ds = deltas(b.readings).length
+    const t = trend(b.readings)
+    widths.push(pillPx([PX.icon, textPx(short(b.context.tokens)), ...(ds > 0 ? [ds * PX.sparkBar] : []), ...(t ? [textPx(t)] : [])]))
+  }
+  for (const l of limits) {
+    const rest = left(l.resetsAt, b.now)
+    widths.push(pillPx([PX.icon, textPx('5h'), 0, textPx(`${Math.round(l.percent)}%`), ...(rest ? [PX.smallIcon, textPx(rest)] : [])]))
+  }
+  if (isOneRow) {
+    if (b.cache) {
+      const v = cacheView(b, b.cache, isWorking)
+      widths.push(pillPx([PX.icon, textPx(v.status), ...(v.canExtend ? [textPx(v.buttonLabel) + PX.button] : []), ...(v.isAsking ? [textPx('Let it expire')] : [])]))
+    }
+    if (b.credits) widths.push(pillPx([PX.icon, textPx(creditsText(b.credits))]))
+    if (b.agentIds.length > 0) widths.push(pillPx([PX.icon, textPx(agentsText(b))]))
+  }
+  const spare = columns * PX.cell - PX.band - widths.reduce((a, n) => a + n, 0) - (widths.length - 1) * PX.between
+  return Math.max(GAUGE.minWidth * PX.cell, Math.round((spare / Math.max(1, limits.length)) * BAR_SLACK))
+}
+
 function drawLine($: $, els: Els, b: Bar, isWorking: boolean, columns: number) {
   const { Box } = els
+  const needs = oneRowCells(b, isWorking)
+  const isOneRow = columns >= needs + (wasTwoRows ? HYSTERESIS_CELLS : 0)
+  wasTwoRows = !isOneRow
+  const barPx = barWidthPx(b, isWorking, columns, isOneRow)
   const usage = [
     b.context && contextPill(els, b),
-    b.session && limitPill(els, 'five_hour', '5h', b.session, b.now),
-    b.weekly && limitPill(els, 'seven_day', '7d', b.weekly, b.now),
+    b.session && limitPill(els, 'five_hour', '5h', b.session, b.now, barPx),
+    b.weekly && limitPill(els, 'seven_day', '7d', b.weekly, b.now, barPx),
   ].filter(Boolean)
   const cache = b.cache && cachePill($, els, b, b.cache, isWorking)
   const credits = b.credits && creditsPill(els, b.credits)
   const agents = b.agentIds.length > 0 && agentsPill(els, b)
-  const needs = oneRowCells(b, isWorking)
-  const isOneRow = columns >= needs + (wasTwoRows ? HYSTERESIS_CELLS : 0)
-  wasTwoRows = !isOneRow
-  lastLayout = `${columns} columns, one row needs ~${needs}: ${isOneRow ? 'one row' : 'two rows'}`
+  lastLayout = `${columns} columns, one row needs ~${needs}: ${isOneRow ? 'one row' : 'two rows'}, bars ${barPx}px`
   // One row: the limit pills take the spare width, or give it back, their bars
   // stretching or shrinking down to a minimum.
   if (isOneRow)
@@ -834,7 +864,7 @@ function contextPill(els: Els, b: Bar) {
   return pill(els, 'context', TINTS.context!, parts, card)
 }
 
-function limitPill(els: Els, kind: 'five_hour' | 'seven_day', label: string, l: Limit, now: number) {
+function limitPill(els: Els, kind: 'five_hour' | 'seven_day', label: string, l: Limit, now: number, barPx: number) {
   const { Box, Text, Svg } = els
   const elapsed = elapsedPercent(l, SPANS[kind] ?? DAY, now)
   const tone = toneOf(l.percent)
@@ -848,7 +878,7 @@ function limitPill(els: Els, kind: 'five_hour' | 'seven_day', label: string, l: 
     // its content and its reset time never spills out. No key: a keyed Box is
     // a hover scope, and the pill's own must hold.
     <Box width={GAUGE.minWidth} flexGrow={1} flexShrink={0}>
-      <Svg source={gaugeSvg(kind, l.percent, elapsed, tone)} alt={`${label} ${l.percent}% used`} height={GAUGE.height} />
+      <Svg source={gaugeSvg(kind, l.percent, elapsed, tone, barPx)} alt={`${label} ${l.percent}% used`} height={GAUGE.height} />
     </Box>,
     <Text key="value" bold color={TEXT_COLOR[tone]}>
       {Math.round(l.percent)}%
