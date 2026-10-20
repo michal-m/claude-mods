@@ -1,0 +1,13 @@
+{
+  "name": "claude-mods",
+  "description": "Michal's personal Claude Code mods.",
+  "owner": {
+    "name": "Michal Zalanowski"
+  },
+  "plugins": [
+    {
+      "name": "usage-bar",
+      "source": "./usage-bar"
+    }
+  ]
+}
