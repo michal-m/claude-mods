@@ -627,6 +627,12 @@ const ICONS = {
   // A clock turning back: the time left before the window starts over.
   clock: (c: string) =>
     `<path d="M4.2 13A8 8 0 1 0 6.6 6.2" fill="none" stroke="${c}" stroke-width="2.1" stroke-linecap="round"/><path d="M3.4 3.6v4.2h4.2" fill="none" stroke="${c}" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/><path d="M12 8v4.6l3 1.8" fill="none" stroke="${c}" stroke-width="2.1" stroke-linecap="round"/>`,
+  // A circling arrow: start the countdown over.
+  renew: (c: string) =>
+    `<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3" fill="none" stroke="${c}" stroke-width="2.1" stroke-linecap="round"/><path d="M18.4 2.8v4.4H14" fill="none" stroke="${c}" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/>`,
+  // An hourglass: let the time run out.
+  hourglass: (c: string) =>
+    `<path d="M6 3h12M6 21h12M7.5 3v2.5c0 2.4 4.5 4.3 4.5 6.5s-4.5 4.1-4.5 6.5V21M16.5 3v2.5c0 2.4-4.5 4.3-4.5 6.5s4.5 4.1 4.5 6.5V21" fill="none" stroke="${c}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`,
   bolt: (c: string) =>
     `<path d="M13.2 2 4 13.6h7.2L10.4 22l9.2-11.6h-7.2z" fill="${c}" fill-opacity="0.18" stroke="${c}" stroke-width="2" stroke-linejoin="round"/>`,
   coin: (c: string) =>
@@ -731,7 +737,6 @@ const PX = {
   pill: 22, // border and padding, both sides
   between: 10, // columnGap 1 between pills
   band: 20, // the band's own padding
-  button: 12, // the native button's chrome around its label
   sparkBar: SPARK.bar + SPARK.gap,
 }
 // Spare room kept on a one-row band (split view showed the estimate runs short).
@@ -743,13 +748,17 @@ const textPx = (text: string) => text.length * PX.char
 const pillPx = (parts: number[]) => PX.pill + parts.reduce((a, n) => a + n, 0) + (parts.length - 1) * PX.gap
 
 // Each changing value counts at its widest form, so a ticking countdown or a
-// growing token count never moves the threshold.
+// growing token count never moves the threshold. Parts not drawn count as
+// nothing: reserving them too kept a band with plenty of room on two rows.
 const widest = (text: string, template: string) => textPx(text.length > template.length ? text : template)
 
 function oneRowCells(b: Bar, isWorking: boolean) {
   const widths: number[] = []
   if (b.context) {
-    widths.push(pillPx([PX.icon, widest(short(b.context.tokens), '999.9k'), (HISTORY - 1) * PX.sparkBar, widest(trend(b.readings), '▲ +99.9k')]))
+    // The sparkline and trend appear over the first prompts, then stay.
+    const ds = deltas(b.readings).length
+    const t = trend(b.readings)
+    widths.push(pillPx([PX.icon, widest(short(b.context.tokens), '999.9k'), ...(ds > 0 ? [ds * PX.sparkBar] : []), ...(t ? [widest(t, '▲ +99.9k')] : [])]))
   }
   for (const l of [b.session, b.weekly]) {
     if (!l) continue
@@ -757,8 +766,9 @@ function oneRowCells(b: Bar, isWorking: boolean) {
   }
   if (b.cache) {
     const v = cacheView(b, b.cache, isWorking)
-    // The widest it gets: the reminder, with both buttons.
-    widths.push(pillPx([PX.icon, widest(v.status, '60m'), textPx('↻\u00a0Keep\u00a0alive') + PX.button, textPx('Let it expire')]))
+    // Extend counts even while a turn hides it, so a turn never flips the
+    // layout; the reminder's two buttons count only while they show.
+    widths.push(pillPx([PX.icon, widest(v.status, '60m'), PX.smallIcon, textPx(v.buttonLabel), ...(v.isAsking ? [textPx('│'), PX.smallIcon, textPx('Let it expire')] : [])]))
   }
   if (b.credits) widths.push(pillPx([PX.icon, widest(creditsText(b.credits), '€000.00')]))
   if (b.agentIds.length > 0) widths.push(pillPx([PX.icon, widest(agentsText(b), '9 running · 99')]))
@@ -786,7 +796,7 @@ function barWidthPx(b: Bar, isWorking: boolean, columns: number, isOneRow: boole
   if (isOneRow) {
     if (b.cache) {
       const v = cacheView(b, b.cache, isWorking)
-      widths.push(pillPx([PX.icon, textPx(v.status), ...(v.canExtend ? [textPx(v.buttonLabel) + PX.button] : []), ...(v.isAsking ? [textPx('Let it expire')] : [])]))
+      widths.push(pillPx([PX.icon, textPx(v.status), ...(v.canExtend ? [PX.smallIcon, textPx(v.buttonLabel)] : []), ...(v.isAsking ? [textPx('│'), PX.smallIcon, textPx('Let it expire')] : [])]))
     }
     if (b.credits) widths.push(pillPx([PX.icon, textPx(creditsText(b.credits))]))
     if (b.agentIds.length > 0) widths.push(pillPx([PX.icon, textPx(agentsText(b))]))
@@ -900,6 +910,15 @@ function limitPill(els: Els, kind: 'five_hour' | 'seven_day', label: string, l: 
   return pill(els, kind, TINTS[kind]!, parts, card, true)
 }
 
+// A pressable link, not a Button: a desktop draws every Button as its native
+// button, which on Windows stands taller than the pill. A Markdown link is the
+// one other thing a press reaches; it draws in the app's link color, and its
+// address (a reserved .invalid host) is answered here, never opened.
+function action({ Markdown }: Els, key: string, label: string, onPress: () => void) {
+  const href = `https://usage-bar.invalid/${key}`
+  return <Markdown key={key} text={`[${label}](${href})`} pressableLinks={[href]} onLinkPress={() => onPress()} />
+}
+
 // What the cache pill shows; shared with the width estimate.
 function cacheView(b: Bar, c: Cache, isWorking: boolean) {
   const ms = cacheLeftMs(b, c)
@@ -918,12 +937,12 @@ function cacheView(b: Bar, c: Cache, isWorking: boolean) {
           : minutes > 1
             ? `${minutes}m`
             : '<\u00a01m'
-  const buttonLabel = isAsking ? '↻\u00a0Keep\u00a0alive' : '↻\u00a0Extend'
+  const buttonLabel = isAsking ? 'Keep\u00a0alive' : 'Extend'
   return { isExpired, isAsking, canExtend, status, buttonLabel }
 }
 
 function cachePill($: $, els: Els, b: Bar, c: Cache, isWorking: boolean) {
-  const { Text, Button } = els
+  const { Text } = els
   const ttl = ttlMs(b)
   const { isExpired, isAsking, canExtend, status, buttonLabel } = cacheView(b, c, isWorking)
   const look = isExpired ? 'cacheGone' : isAsking ? 'cacheSoon' : 'cache'
@@ -939,16 +958,12 @@ function cachePill($: $, els: Els, b: Bar, c: Cache, isWorking: boolean) {
         extend failed
       </Text>
     ),
-    canExtend && (
-      // The app's own button, not plain text: it reads as something to press.
-      <Button
-        key="extend"
-        label={buttonLabel}
-        variant={isAsking ? 'primary' : 'secondary'}
-        onPress={() => keepAlive($)}
-      />
-    ),
-    isAsking && <Button key="let-expire" label="Let it expire" plain dimColor onPress={() => letExpire($)} />,
+    // Each icon beside its link, not in it: only the words are underlined.
+    canExtend && icon(els, 'extend-icon', ICONS.renew(ICON_COLOR[look]), 'Restart the countdown', SMALL_ICON),
+    canExtend && action(els, 'extend', buttonLabel, () => keepAlive($)),
+    isAsking && divider(els, 'or'),
+    isAsking && icon(els, 'let-expire-icon', ICONS.hourglass(ICON_COLOR[look]), 'Let it run out', SMALL_ICON),
+    isAsking && action(els, 'let-expire', 'Let it expire', () => letExpire($)),
   ]
   const card = hoverCard(els, [
     isExpired ? `Prompt cache expired at ${clockTime(c.lastAt + ttl)}` : `Prompt cache expires at ${clockTime(c.lastAt + ttl)}`,

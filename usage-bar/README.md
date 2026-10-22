@@ -3,7 +3,7 @@
 One band of tinted pills above the prompt in the Claude desktop app's Code tab:
 
 ```
-(◑ 371k ▁▃▂█ ▲ +17.6k) (◷ 5h ━━━╍╍──── 7% ↺ 2h 53m) (▦ 7d ━━━━━━━╍─ 77% ↺ 22h 53m) (⚡ 51m [↻ Extend]) ($ €0.00) (🤖 1 agent)
+(◑ 371k ▁▃▂█ ▲ +17.6k) (◷ 5h ━━━╍╍──── 7% ↺ 2h 53m) (▦ 7d ━━━━━━━╍─ 77% ↺ 22h 53m) (⚡ 51m ↻ _Extend_) ($ €0.00) (🤖 1 agent)
 ```
 
 At Medium and Wide chat widths everything sits on one row, and the 5h and 7d pills share the spare width, their bars stretching to fill it. When the chat column is too narrow for that (Narrow, or a split view), the band uses two rows: context, 5h and 7d on top, and on a right-aligned second row cache, agents and credits, with credits rightmost. The band switches a little before the row gets tight, and once it is on two rows it only goes back with clear room to spare, so it doesn't jump between layouts.
@@ -12,7 +12,7 @@ Point at any pill to see more detail.
 
 - **Context**: a circle that fills by quarters with the context window (`○ ◔ ◑ ◕ ●`; blue, then orange from 50%, red from 75%), the tokens in context, one bar per recent prompt (the tokens it added), and the last prompt's change.
 - **5h / 7d**: share of your session and weekly limits used, then the time until reset. Colored as Claude's own usage bars: green under 75%, orange from 75%, red from 90%. The solid part is what you've used. The hatched part is the gap to the time elapsed: grey while you're behind the clock, in the bar's color when you're using faster than time passes. The hover card gives the reset time.
-- **Cache**: time left before the prompt cache expires (`51m`). **Extend** sends one tiny request over the conversation, which reads the cached context back and restarts the countdown. That costs about a tenth of the normal input price and counts against your limits. Five minutes before expiry (one minute for a 5-minute cache) a toast pops up and the pill offers **Keep alive** or **Let it expire**. No button while a turn runs, after expiry, or after a compaction: the next message writes a new cache anyway.
+- **Cache**: time left before the prompt cache expires (`51m`). **Extend** sends one tiny request over the conversation, which reads the cached context back and restarts the countdown. That costs about a tenth of the normal input price and counts against your limits. Five minutes before expiry (one minute for a 5-minute cache) a toast pops up and the pill offers **Keep alive** or **Let it expire**. No link while a turn runs, after expiry, or after a compaction: the next message writes a new cache anyway.
 - **Credits**: extra-usage credits this session spent (`$0.00` until it spends any), or `disabled` when extra usage is off on your account. The hover card links to your balance on claude.ai.
 - **Agents**: subagents this session, and how many are running. The hover card lists the running ones.
 

@@ -224,17 +224,17 @@ test('cache: counts down an hour on a plan, Extend restarts it', async ($, on) =
   await step($)
   let ui = await band($)
   expect(await texts(ui)).toContain('60m')
-  expect(await ui.find({ type: 'Button', key: 'extend' })).toBeDefined()
-  expect(await ui.find({ type: 'Button', key: 'let-expire' })).toBeUndefined()
+  expect(await ui.find({ type: 'Markdown', key: 'extend' })).toBeDefined()
+  expect(await ui.find({ type: 'Markdown', key: 'let-expire' })).toBeUndefined()
 
   // 56 minutes on: the reminder, Keep alive and Let it expire.
   await clock.advance(56 * MINUTE)
   ui = await band($)
   expect(await texts(ui)).toContain('4m')
-  expect((await ui.find({ type: 'Button', key: 'extend' }))?.props.label.replace(/\u00a0/g, ' ')).toBe('↻ Keep alive')
-  expect(await ui.find({ type: 'Button', key: 'let-expire' })).toBeDefined()
+  expect((await ui.find({ type: 'Markdown', key: 'extend' }))?.props.text.replace(/\u00a0/g, ' ')).toBe('[Keep alive](https://usage-bar.invalid/extend)')
+  expect(await ui.find({ type: 'Markdown', key: 'let-expire' })).toBeDefined()
 
-  await ui.press({ key: 'extend' })
+  await ui.press({ key: 'extend', link: { href: 'https://usage-bar.invalid/extend' } })
   expect(w.forks).toBe(1)
   ui = await band($)
   expect(await texts(ui)).toContain('60m')
@@ -246,10 +246,10 @@ test('cache: Let it expire hides the question', async ($, on) => {
   await step($)
   await clock.advance(56 * MINUTE)
   let ui = await band($)
-  await ui.press({ key: 'let-expire' })
+  await ui.press({ key: 'let-expire', link: { href: 'https://usage-bar.invalid/let-expire' } })
   ui = await band($)
-  expect(await ui.find({ type: 'Button', key: 'let-expire' })).toBeUndefined()
-  expect((await ui.find({ type: 'Button', key: 'extend' }))?.props.label.replace(/\u00a0/g, ' ')).toBe('↻ Extend')
+  expect(await ui.find({ type: 'Markdown', key: 'let-expire' })).toBeUndefined()
+  expect((await ui.find({ type: 'Markdown', key: 'extend' }))?.props.text.replace(/\u00a0/g, ' ')).toBe('[Extend](https://usage-bar.invalid/extend)')
 })
 
 test('cache: 5 minutes once past a limit, then expired with no button', async ($, on) => {
@@ -261,7 +261,7 @@ test('cache: 5 minutes once past a limit, then expired with no button', async ($
   await clock.advance(6 * MINUTE)
   ui = await band($)
   expect(await texts(ui)).toContain('expired')
-  expect(await ui.find({ type: 'Button', key: 'extend' })).toBeUndefined()
+  expect(await ui.find({ type: 'Markdown', key: 'extend' })).toBeUndefined()
 })
 
 test('cache: an environment override wins over the plan default', async ($, on) => {
@@ -288,7 +288,7 @@ test('cache: no Extend while a turn runs', async ($, on) => {
   await step($)
   const ui = await band($, 'desktop', true)
   expect(await texts(ui)).toContain('in use')
-  expect(await ui.find({ type: 'Button', key: 'extend' })).toBeUndefined()
+  expect(await ui.find({ type: 'Markdown', key: 'extend' })).toBeUndefined()
 })
 
 test('agents: running and total, the running ones in the card', async ($, on) => {
@@ -317,6 +317,16 @@ test('layout: one row when wide, two rows when narrow with credits rightmost', a
   expect(extras.children.map((c: any) => c.props.key)).toEqual(['cache', 'agents', 'credits'])
   const usage: any = await ui.find({ type: 'Box', key: 'usage-row' })
   expect(usage.children.map((c: any) => c.props.key)).toEqual(['context', 'five_hour', 'seven_day'])
+})
+
+test('layout: a medium band holds one row while parts not drawn yet take no room', async ($, on) => {
+  // As at the start of a session: one context reading (no chart, no trend),
+  // a turn running (no Extend), no agents.
+  world(on)
+  await start($)
+  await step($)
+  const ui = await band($, 'desktop', true, 95)
+  expect(await ui.find({ type: 'Box', key: 'extras-row' })).toBeUndefined()
 })
 
 test('terminal: the engine draws its own band', async ($, on) => {
