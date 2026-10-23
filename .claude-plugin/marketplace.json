@@ -1,8 +1,8 @@
 {
   "name": "claude-mods",
-  "description": "Michal's personal Claude Code mods.",
+  "description": "Michał's personal Claude Code mods.",
   "owner": {
-    "name": "Michal Zalanowski"
+    "name": "Michał J. Musiał"
   },
   "plugins": [
     {

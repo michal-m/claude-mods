@@ -2,7 +2,7 @@
   "name": "usage-bar",
   "version": "0.2.2",
   "description": "One band above the prompt: context fill, 5-hour and 7-day limits, prompt cache with a keep-alive button, usage credits spent, and subagents.",
-  "author": { "name": "Michal Zalanowski", "email": "michal@zalanowski.pl" },
+  "author": { "name": "Michał J. Musiał", "email": "michal.j.musial@gmail.com" },
   "license": "Apache-2.0",
   "repository": "https://github.com/michal-m/claude-mods",
   "types": "./types/index.d.ts"
