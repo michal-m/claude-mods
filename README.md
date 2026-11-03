@@ -20,6 +20,7 @@ claude-mods/
 | Mod | Description |
 | --- | --- |
 | [usage-bar](usage-bar/) | One band above the prompt: context, 5h/7d limits, prompt cache with a keep-alive button, usage credits, subagents. |
+| [memory-hook](memory-hook/) | Asks before Claude writes to its auto-memory, showing the change in the usual permission dialog. |
 
 ## Installing
 

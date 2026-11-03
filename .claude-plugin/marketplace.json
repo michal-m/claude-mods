@@ -8,6 +8,10 @@
     {
       "name": "usage-bar",
       "source": "./usage-bar"
+    },
+    {
+      "name": "memory-hook",
+      "source": "./memory-hook"
     }
   ]
 }
