@@ -33,9 +33,22 @@ test('editing the memory index asks first', async ($, on) => {
   expect(seen[index]).toBe('ask')
 })
 
+test('writing a memory file with Windows paths asks first', async ($, on) => {
+  const seen = verdicts(on)
+  const paths = [
+    'C:\\Users\\me\\.claude\\projects\\C--Users-me-app\\memory\\user-role.md',
+    'C:/Users/me/.claude/projects/C--Users-me-app/memory/user-role.md',
+  ]
+
+  for (const file_path of paths) {
+    await $.tool.call({ tool: 'Write', file_path, content: 'x' })
+    expect(seen[file_path]).toBe('ask')
+  }
+})
+
 test('writes elsewhere are left alone', async ($, on) => {
   const seen = verdicts(on)
-  const elsewhere = ['/Users/me/app/src/memory/cache.ts', '/Users/me/.claude/CLAUDE.md', '/Users/me/.claude/projects/-Users-me-app/notes.md']
+  const elsewhere = ['/Users/me/app/src/memory/cache.ts', '/Users/me/.claude/CLAUDE.md', '/Users/me/.claude/projects/-Users-me-app/notes.md', 'C:\\Users\\me\\.claude\\CLAUDE.md', 'C:\\Users\\me\\app\\src\\memory\\cache.ts']
 
   for (const file_path of elsewhere) {
     const r = await $.tool.call({ tool: 'Write', file_path, content: 'x' })

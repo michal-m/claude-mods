@@ -1,6 +1,6 @@
 {
   "name": "memory-hook",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Asks before Claude writes to its auto-memory, showing the change in the usual permission dialog.",
   "author": { "name": "Michał J. Musiał", "email": "michal.j.musial@gmail.com" },
   "license": "Apache-2.0",

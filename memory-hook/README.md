@@ -17,5 +17,5 @@ Nothing else is touched: `CLAUDE.md` files, your own `#` and `/memory` edits, an
 ## Limits
 
 - Only `Write` and `Edit` are checked. A memory written through a shell command (`cat > …/memory/x.md`) isn't caught. Claude normally uses `Write` for memories.
-- The memory folder is matched as `/.claude/projects/<project>/memory/`. With `CLAUDE_CONFIG_DIR` pointing somewhere not named `.claude`, or a custom memory directory, writes there aren't caught.
+- The memory folder is matched as `/.claude/projects/<project>/memory/`, with either slash on Windows. With `CLAUDE_CONFIG_DIR` pointing somewhere not named `.claude`, or a custom memory directory, writes there aren't caught.
 - In a non-interactive run (`claude -p`) there is no one to ask, so memory writes are refused.

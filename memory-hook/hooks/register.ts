@@ -3,7 +3,8 @@ import type { Register } from 'claude-code'
 // Every write to the auto-memory folder (~/.claude/projects/<project>/memory/)
 // goes through Claude Code's own permission dialog, whatever the permission
 // mode, so the diff can be read before it lands. Declining refuses the write.
-const MEMORY_FILE = /\/\.claude\/projects\/[^/]+\/memory\//
+// Windows paths may use either slash.
+const MEMORY_FILE = /[\\/]\.claude[\\/]projects[\\/][^\\/]+[\\/]memory[\\/]/
 
 const isMemoryWrite = (tool: string, input: { file_path?: unknown }) =>
   (tool === 'Write' || tool === 'Edit') && typeof input.file_path === 'string' && MEMORY_FILE.test(input.file_path)
